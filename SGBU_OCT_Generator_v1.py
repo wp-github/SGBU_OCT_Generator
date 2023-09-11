@@ -126,6 +126,8 @@ def output_cleaning(leads_in, output_cols):
 
     #sort and drop dupe gclids
     leads_out.sort_values('Conversion Time', ascending=True, inplace=True)
+    fudge_factor = variables['Fudge Factor'][0].astype(int)
+    leads_out['Conversion Time'] = leads_out['Conversion Time']+pd.Timedelta(hours=fudge_factor)
     #leads_out.drop_duplicates(subset='Google Click ID', keep='first', inplace=True)
     leads_out.reset_index(drop=True, inplace=True)
     
