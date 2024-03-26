@@ -177,6 +177,85 @@ def google_upload(leads):
     print('Writing to Google Sheets...')
     worksheet1.update([pd.DataFrame(columns=['Parameters:TimeZone=+0000']).columns.values.tolist()] + [leads.columns.values.tolist()] + leads.values.tolist())
 
+def new_output_cleaning(output_cols):
+    logger.info('Executing new_output_cleaning(leads_in, output_cols)')
+    print('Setting up output for new conversions...')
+    
+    leads_in_path = variables['Lead Input:'][0]
+    if 'csv' in leads_in_path:
+        leads_in = pd.read_csv(leads_in_path)
+    else:
+        leads_in = pd.read_excel(leads_in_path)
+    
+    lookback = variables['OCT Lookback'][0].astype(int)
+    leads_in['Action Timestamp (MST)'] = pd.to_datetime(leads_in['Action Timestamp (MST)'])
+    leads_in = leads_in.loc[leads_in['Action Timestamp (MST)']>=(leads_in['Action Timestamp (MST)'].max()-pd.Timedelta(lookback, unit='days'))]
+    # clean - get gclid from landing_url or referrer fields
+    leads_in['gclid'] = leads_in['landing_url'].replace('.*&gclid=','', regex=True)
+    leads_in.loc[leads_in['gclid'].str.contains('https://', na=False), 'gclid'] = np.nan
+    
+    leads_in = leads_in.loc[leads_in['gclid'].notnull()]
+    leads_in.reset_index(drop=True, inplace=True)
+    leads_in.rename(columns={'Action Timestamp (MST)':'Conversion Time', 'gclid':'Google Click ID', 'Profit':'Conversion Value'}, inplace=True)
+    
+    leads_in['Conversion Name'] = np.nan
+    leads_in.loc[(leads_in['New Customer']==1) & (leads_in['Action Type']=='Sale'), 'Conversion Name'] = 'OCT Profit - New Customer'
+    leads_in.loc[(leads_in['New Customer'].isnull()) & (leads_in['Action Type']=='Sale'), 'Conversion Name'] = 'OCT Profit - Previous Purchaser'
+    
+    leads_in = leads_in.loc[leads_in['Conversion Name'].notnull()]
+    leads_in['Conversion Value'] = (leads_in['Conversion Value'] * 0.05).where(leads_in['Conversion Name'] == 'OCT Profit - Previous Purchaser', leads_in['Conversion Value'])
+    
+    
+    leads_in['Conversion Currency'] = 'USD'
+    leads_out = leads_in.filter(output_cols)
+    leads_out = leads_out.loc[leads_out['Conversion Value'].notnull()]
+    leads_out.reset_index(drop=True, inplace=True)    
+
+    #sort and drop dupe gclids
+    leads_out.sort_values('Conversion Time', ascending=True, inplace=True)
+    fudge_factor = variables['Fudge Factor'][0].astype(int)
+    leads_out['Conversion Time'] = leads_out['Conversion Time']+pd.Timedelta(hours=fudge_factor)
+    #leads_out.drop_duplicates(subset='Google Click ID', keep='first', inplace=True)
+    leads_out.reset_index(drop=True, inplace=True)
+    
+    return(leads_out)
+
+def new_google_upload(leads):
+    logger.info('Executing google_upload(leads)')
+    import gspread
+    #from gspread_dataframe import set_with_dataframe
+    from google.oauth2.service_account import Credentials
+    #from pydrive.auth import GoogleAuth
+    #from pydrive.drive import GoogleDrive
+    scopes = ['https://www.googleapis.com/auth/spreadsheets',
+              'https://www.googleapis.com/auth/drive']
+    
+    cred_path = variables['OCT Credentials'][1]
+    credentials = Credentials.from_service_account_file(cred_path, scopes=scopes)
+    
+    gc = gspread.authorize(credentials)
+    
+    #gauth = GoogleAuth()
+    #drive = GoogleDrive(gauth)
+    # open a google sheet
+    gs_key = variables['Google Sheet Key'][1]
+    gs = gc.open_by_key(gs_key)
+    # select a work sheet from its name
+    worksheet1 = gs.worksheet('Sheet1')
+    
+    #clear worksheet
+    worksheet1.clear()
+    
+    #sort leads latest to earliest; keep only n rows
+    leads.sort_values('Conversion Time', ascending=False, inplace=True)
+    size = variables['OCT Lookback'][0]
+    leads = leads.loc[leads['Conversion Time']>=(leads['Conversion Time'].max() - pd.Timedelta(size,unit='day'))]
+    leads.reset_index(drop=True, inplace=True) 
+    leads['Conversion Time'] = leads['Conversion Time'].astype(str) #convert date to JSON friendly format
+    #put in new worksheet
+    print('Writing to Google Sheets...')
+    worksheet1.update([pd.DataFrame(columns=['Parameters:TimeZone=+0000']).columns.values.tolist()] + [leads.columns.values.tolist()] + leads.values.tolist())
+
 
 def main():
     logger.info('Executing main() method...')
@@ -197,13 +276,23 @@ def main():
                'Conversion Value', 
                'Conversion Currency']
     
+    lookback = variables['OCT Lookback'][0].astype(int)
+    
     leads_in = leads_input() # Read in leads
-    leads_in = leads_in.loc[leads_in['Action Timestamp (MST)']>=(leads_in['Action Timestamp (MST)'].max()-pd.Timedelta(90, unit='days'))]
+    leads_in = leads_in.loc[leads_in['Action Timestamp (MST)']>=(leads_in['Action Timestamp (MST)'].max()-pd.Timedelta(lookback, unit='days'))]
     leads_in = gclid_cleaning(leads_in) # clean gclids
     leads_out = output_cleaning(leads_in, output_cols) # prep output
     
     write_out(leads_out) # write output
     google_upload(leads_out) #uplaod to Google Sheets
+    
+    new_leads_out = new_output_cleaning(output_cols)
+    new_google_upload(new_leads_out)
+    new_out_path = variables['Output Files:'][1]
+    print('Writing output to {}'.format(new_out_path))
+    pd.DataFrame(columns=['Parameters:TimeZone=+0000']).to_csv(new_out_path, index=False)
+    new_leads_out.to_csv(new_out_path, header=True, index=False, mode='a')    
+    
     input("Press any key to end...")
     
 ############################
@@ -217,7 +306,7 @@ if __name__ == '__main__':
         print('Running...')        
         global variables
         variables = read_variables(cwd, 'SGBU_OCT*.xlsx')
-        main()
+        #main()
     except:
         logger.exception('Got exception on handler')
         raise
